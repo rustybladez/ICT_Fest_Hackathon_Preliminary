@@ -4,7 +4,7 @@
 **Codebase:** CoWork (FastAPI + SQLAlchemy + SQLite, JWT auth)
 **Baseline commit:** `5bb6f56` (*Initial commit*) — all line numbers below refer to this baseline.
 
-This report documents **23 bugs** found and fixed across the codebase. For each bug it
+This report documents **24 bugs** found and fixed across the codebase. For each bug it
 gives the location, the business rule it violated, the root cause and observable
 incorrect behavior, the fix (before/after), and a concrete test case with the
 before/after result.
@@ -52,6 +52,7 @@ those sleeps in place**.
 | `test_conc_bookings` | double-booking / quota / duplicate-refund (HTTP) | 1/8 | **9/9** |
 | `test_conc_notifications` | notification deadlock | 1/4 | **4/4** |
 | `test_hardening` | malformed-datetime 500, availability cache key | 6/12 | **16/16** |
+| `test_conc_registration` | concurrent registration races | 6/8 | **8/8** |
 
 Concurrency suites were run repeatedly (3–4×) to confirm stability.
 
@@ -84,6 +85,7 @@ Concurrency suites were run repeatedly (3–4×) to confirm stability.
 | 21 | Hard | `app/services/notifications.py` | L24–35 | 16 | Inverse lock ordering → deadlock hangs the service |
 | 22 | Easy | `app/routers/bookings.py` | L82–83 | Errors | Malformed datetime input crashed with 500 instead of 400 |
 | 23 | Medium | `app/routers/rooms.py` | L69–99 | 13 | Availability cache keyed by raw date string → deterministically stale |
+| 24 | Hard | `app/routers/auth.py` | L24–53 | 15,16 | Concurrent registration crashed with 500 (unhandled IntegrityError) |
 
 *§ Rule reference for Bug 10 is the response-schema contract for `GET /bookings/{id}`.*
 
@@ -673,6 +675,45 @@ cache.set_availability(room.id, date_key, result)
 
 ---
 
+### Bug 24 — Concurrent registration crashes with 500
+- **File/line:** `app/routers/auth.py:24–53` (`register`)
+- **Rule violated:** 15 (registration semantics) / 16 (robustness under concurrency).
+- **Root cause:** registration is check-then-insert against the unique constraints
+  (`organizations.name`, `uq_user_org_username`) with no race handling. Two concurrent
+  requests for the same **new org name** both pass the `org is None` check and both
+  insert → the loser's `commit()` raises `IntegrityError`, which was unhandled →
+  **HTTP 500** (should join the just-created org as `member`). Likewise, two concurrent
+  requests for the same **org + username** both pass the `existing` check and both
+  insert the user → the loser 500s instead of returning `409 USERNAME_TAKEN`.
+
+```python
+# org creation
+try:
+    db.commit(); db.refresh(org); created_org = True
+except IntegrityError:
+    db.rollback()
+    org = db.query(Organization).filter(Organization.name == payload.org_name).first()
+role = "admin" if created_org else "member"
+...
+# user creation
+try:
+    db.commit(); db.refresh(user)
+except IntegrityError:
+    db.rollback()
+    raise AppError(409, "USERNAME_TAKEN", "Username already taken")
+```
+
+- **Test cases (real server, 6 barrier-synchronized registrations):**
+  - Same new org, distinct usernames.
+    - Before: some requests `500`. After: **six `201`, exactly one `admin` + five
+      `member`s.**
+  - Same org, same username.
+    - Before: `[500, 500, 500, 201, 500, 500]`. After: **exactly one `201`, five `409`
+      `USERNAME_TAKEN`, no 500s.**
+  - Sequential registration and the duplicate-username 409 path (Bug 5) are unchanged.
+
+---
+
 ## 7. Concurrency deep-dive: why a lock alone was not enough
 
 The booking/cancel fixes (Bugs 18–20) required care beyond "wrap it in a lock",
@@ -735,7 +776,7 @@ regression guards.
 | File | Bugs addressed |
 |------|----------------|
 | `app/auth.py` | 1, 2, 3 |
-| `app/routers/auth.py` | 3, 5 |
+| `app/routers/auth.py` | 3, 5, 24 |
 | `app/timeutils.py` | 4 |
 | `app/routers/bookings.py` | 6, 7, 8, 9, 10, 11, 12, 13, 18, 19, 20, 22 |
 | `app/routers/rooms.py` | 23 |
@@ -746,5 +787,5 @@ regression guards.
 | `app/services/stats.py` | 17 |
 | `app/services/notifications.py` | 21 |
 
-**Total: 23 bugs fixed** — 11 Easy, 5 Medium, 7 Hard *(difficulty tags are our own
+**Total: 24 bugs fixed** — 11 Easy, 5 Medium, 8 Hard *(difficulty tags are our own
 estimates; the challenge does not label individual bugs)*.
