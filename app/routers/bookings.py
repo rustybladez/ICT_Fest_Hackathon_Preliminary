@@ -1,4 +1,5 @@
 """Booking creation, listing, detail and cancellation."""
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -22,6 +23,12 @@ MIN_DURATION_HOURS = 1
 MAX_DURATION_HOURS = 8
 QUOTA_LIMIT = 3
 QUOTA_WINDOW_HOURS = 24
+
+# Serializes the check-then-write critical sections of booking creation and
+# cancellation so concurrent requests cannot both pass a check and then both
+# commit (double-booking, quota bypass, duplicate refunds). A single lock also
+# means only one writer touches SQLite at a time, avoiding write-lock contention.
+_booking_write_lock = threading.Lock()
 
 
 def _pricing_warmup() -> None:
@@ -93,33 +100,43 @@ def create_booking(
     if duration_hours < MIN_DURATION_HOURS or duration_hours > MAX_DURATION_HOURS:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "duration out of range")
 
-    room = db.query(Room).filter(Room.id == payload.room_id, Room.org_id == user.org_id).first()
-    if room is None:
-        raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
+    org_id = user.org_id
+    user_id = user.id
 
-    if _has_conflict(db, room.id, start, end):
-        raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
+    # Drop the read transaction opened by auth before contending for the write
+    # lock, so a thread parked on the lock is not holding a SQLite read lock that
+    # would block the current writer from committing.
+    db.rollback()
 
-    _check_quota(db, user.id, now, start)
+    with _booking_write_lock:
+        room = db.query(Room).filter(Room.id == payload.room_id, Room.org_id == org_id).first()
+        if room is None:
+            raise AppError(404, "ROOM_NOT_FOUND", "Room not found")
 
-    price_cents = room.hourly_rate_cents * duration_hours
-    booking = Booking(
-        room_id=room.id,
-        user_id=user.id,
-        start_time=start,
-        end_time=end,
-        status="confirmed",
-        reference_code=reference.next_reference_code(),
-        price_cents=price_cents,
-        created_at=now,
-    )
-    db.add(booking)
-    db.commit()
-    db.refresh(booking)
+        if _has_conflict(db, room.id, start, end):
+            raise AppError(409, "ROOM_CONFLICT", "Room already booked for this interval")
 
-    stats.record_create(room.id, price_cents)
-    cache.invalidate_availability(room.id, start.date().isoformat())
-    cache.invalidate_report(user.org_id)
+        _check_quota(db, user_id, now, start)
+
+        price_cents = room.hourly_rate_cents * duration_hours
+        booking = Booking(
+            room_id=room.id,
+            user_id=user_id,
+            start_time=start,
+            end_time=end,
+            status="confirmed",
+            reference_code=reference.next_reference_code(),
+            price_cents=price_cents,
+            created_at=now,
+        )
+        db.add(booking)
+        db.commit()
+        db.refresh(booking)
+        room_id = booking.room_id
+
+    stats.record_create(room_id, price_cents)
+    cache.invalidate_availability(room_id, start.date().isoformat())
+    cache.invalidate_report(org_id)
     notifications.notify_created(booking)
 
     return serialize_booking(booking)
@@ -206,22 +223,39 @@ def cancel_booking(
     else:
         refund_percent = 0
 
-    # The RefundLog is the single source of truth for the amount so the response
-    # can never disagree with the stored ledger entry.
-    entry = log_refund(db, booking, refund_percent)
-    refund_amount_cents = entry.amount_cents
+    # Snapshot the fields we need before releasing the read transaction.
+    price_cents = booking.price_cents
+    room_id = booking.room_id
+    start_date = booking.start_time.date().isoformat()
+    org_id = user.org_id
+
+    db.rollback()
+
+    with _booking_write_lock:
+        # Atomic compare-and-swap: only one concurrent cancel flips the row from
+        # confirmed to cancelled, so exactly one RefundLog is ever written.
+        updated = (
+            db.query(Booking)
+            .filter(Booking.id == booking_id, Booking.status == "confirmed")
+            .update({Booking.status: "cancelled"}, synchronize_session=False)
+        )
+        db.commit()
+        if updated == 0:
+            raise AppError(409, "ALREADY_CANCELLED", "Booking already cancelled")
+
+        # The RefundLog is the single source of truth for the amount so the
+        # response can never disagree with the stored ledger entry.
+        entry = log_refund(db, booking_id, price_cents, refund_percent)
+        refund_amount_cents = entry.amount_cents
 
     _settlement_pause()
-    booking.status = "cancelled"
-    db.commit()
-
-    stats.record_cancel(booking.room_id, booking.price_cents)
-    cache.invalidate_report(user.org_id)
-    cache.invalidate_availability(booking.room_id, booking.start_time.date().isoformat())
+    stats.record_cancel(room_id, price_cents)
+    cache.invalidate_report(org_id)
+    cache.invalidate_availability(room_id, start_date)
     notifications.notify_cancelled(booking)
 
     return {
-        "id": booking.id,
+        "id": booking_id,
         "status": "cancelled",
         "refund_percent": refund_percent,
         "refund_amount_cents": refund_amount_cents,

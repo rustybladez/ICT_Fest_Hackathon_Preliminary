@@ -9,18 +9,18 @@ from decimal import ROUND_HALF_UP, Decimal
 
 from sqlalchemy.orm import Session
 
-from ..models import Booking, RefundLog
+from ..models import RefundLog
 
 
-def log_refund(db: Session, booking: Booking, percent: int) -> RefundLog:
+def log_refund(db: Session, booking_id: int, price_cents: int, percent: int) -> RefundLog:
     # Refund amount rounds to the nearest cent, half-cents rounding up.
     amount_cents = int(
-        (Decimal(booking.price_cents) * Decimal(percent) / Decimal(100)).quantize(
+        (Decimal(price_cents) * Decimal(percent) / Decimal(100)).quantize(
             Decimal("1"), rounding=ROUND_HALF_UP
         )
     )
     entry = RefundLog(
-        booking_id=booking.id,
+        booking_id=booking_id,
         amount_cents=amount_cents,
         status="processed",
         processed_at=datetime.utcnow(),
