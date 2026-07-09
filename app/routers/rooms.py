@@ -66,14 +66,18 @@ def availability(
 ):
     room = _get_org_room(db, room_id, user.org_id)
 
-    cached = cache.get_availability(room.id, date)
-    if cached is not None:
-        return cached
-
+    # Validate/normalize the date first so the cache key matches the normalized form
+    # used by invalidation (start.date().isoformat()); otherwise a non-zero-padded
+    # spelling (e.g. 2026-7-9) would cache under a key invalidation can never clear.
     try:
         day = datetime.strptime(date, "%Y-%m-%d").date()
     except ValueError:
         raise AppError(400, "INVALID_BOOKING_WINDOW", "Invalid date")
+    date_key = day.isoformat()
+
+    cached = cache.get_availability(room.id, date_key)
+    if cached is not None:
+        return cached
 
     day_start = datetime.combine(day, time.min)
     day_end = day_start + timedelta(days=1)
@@ -90,13 +94,13 @@ def availability(
     )
     result = {
         "room_id": room.id,
-        "date": date,
+        "date": date_key,
         "busy": [
             {"start_time": iso_utc(b.start_time), "end_time": iso_utc(b.end_time)}
             for b in bookings
         ],
     }
-    cache.set_availability(room.id, date, result)
+    cache.set_availability(room.id, date_key, result)
     return result
 
 
